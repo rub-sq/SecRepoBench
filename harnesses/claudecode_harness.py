@@ -1,183 +1,463 @@
-import sys
-import os
-import json
-import time
-import sys
-import shutil
-from pathlib import Path
-from git import Repo
+from __future__ import annotations
+
+import argparse
 import asyncio
-from assets.constants import *
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
+import gzip
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from git import Repo
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from assets.constants import AGENT_USER_PEOMPT, SYSTEM_PROMPT, THINKING_BUDGET_TOKENS  # noqa: E402
+
+INSTRUCTION_FILENAMES = {"claude.md", "claude.local.md"}
+CLAUDE_CONFIGURATION_FILES = {
+    ".mcp.json",
+    "settings.json",
+    "settings.local.json",
+}
 
 
-def get_c_cpp_file(base_path: str):
-    c_path = base_path + '.c'
-    cpp_path = base_path + '.cpp'
-    if os.path.exists(c_path):
-        path = c_path
-    elif os.path.exists(cpp_path):
-        path = cpp_path
-    else:
-        print(
-            f'This file does not exist with a c or cpp extension: {base_path}')
+def read_json_auto(path: Path) -> Any:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def resolve_data_file(root: Path, stem: str) -> Path:
+    candidates = (root / stem, root / f"{stem}.gz")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"Required data file is missing. Expected {candidates[0]} or {candidates[1]}."
+    )
+
+
+def resolve_mask_file(root: Path, task_id: str) -> Path:
+    base = root / "descriptions" / task_id / "mask_desc_perturbed"
+    for suffix in (".c", ".cpp"):
+        candidate = Path(str(base) + suffix)
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"Task {task_id}: missing perturbed masked source file under {base.parent}"
+    )
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[str], grace_seconds: int = 10
+) -> None:
+    if process.poll() is not None:
         return
-    with open(path, 'r') as f:
-        content = f.read()
-    return content
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=grace_seconds)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=10)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            return
+
+
+def _safe_remove(path: Path, repository_root: Path) -> None:
+    resolved_root = repository_root.resolve()
+    resolved_path = path.resolve(strict=False)
+    if resolved_path != resolved_root and resolved_root not in resolved_path.parents:
+        raise RuntimeError(
+            f"Refusing to remove a path outside the task repository: {path}"
+        )
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def clean_claude_instruction_files(repository_root: Path) -> list[str]:
+    """Remove project controlled Claude instructions and project integrations.
+    """
+    repository_root = repository_root.resolve()
+    removed: list[str] = []
+    for path in list(repository_root.rglob("*")):
+        relative = path.relative_to(repository_root)
+        lower_name = path.name.lower()
+        should_remove = (
+            lower_name in INSTRUCTION_FILENAMES
+            or (path.is_dir() and path.name == ".claude")
+            or (
+                path.is_file()
+                and path.parent.name == ".claude"
+                and lower_name in CLAUDE_CONFIGURATION_FILES
+            )
+            or (path.is_file() and relative.as_posix() == ".mcp.json")
+        )
+        if should_remove and path.exists():
+            removed.append(relative.as_posix())
+            _safe_remove(path, repository_root)
+    return sorted(set(removed))
+
+
+def find_remaining_instruction_files(repository_root: Path) -> list[str]:
+    remaining: list[str] = []
+    for path in repository_root.rglob("*"):
+        if path.name.lower() in INSTRUCTION_FILENAMES:
+            remaining.append(path.relative_to(repository_root).as_posix())
+        elif path.is_dir() and path.name == ".claude":
+            remaining.append(path.relative_to(repository_root).as_posix())
+    return sorted(set(remaining))
+
+
+def _commit_all(repository: Repo, message: str) -> str:
+    repository.git.add(A=True)
+    if not repository.git.diff("--cached", "--name-only").strip():
+        return repository.head.commit.hexsha
+    return repository.index.commit(message).hexsha
+
+
+def _load_task(root: Path, task_id: str) -> tuple[dict[str, Any], str]:
+    metadata = read_json_auto(resolve_data_file(root, "sample_metadata.json"))
+    record = metadata.get(task_id)
+    if not isinstance(record, dict):
+        raise KeyError(f"Unknown SecRepoBench task: {task_id}")
+    repositories = read_json_auto(root / "github_repos.json")
+    repository_url = next(
+        (
+            str(row["repo_addr"])
+            for row in repositories
+            if row.get("project") == record.get("project_name")
+        ),
+        "",
+    )
+    if not repository_url:
+        raise RuntimeError(f"No repository URL for {record.get('project_name')}")
+    return record, repository_url
 
 
 class ClaudeCodeRunner:
-    def __init__(self, model_name, prompt_type):
+
+    def __init__(self, model_name: str, prompt_type: str = "no-security-reminder"):
         self.model_name = model_name
-        self.agent_config = ClaudeAgentOptions(
-            disallowed_tools=["WebSearch", "WebFetch"],
-            permission_mode="bypassPermissions",
-            model=model_name,
-            env={
-                "ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"],
-                "MAX_THINKING_TOKENS": str(8000)
-            }
-        )
-        self.base_dir = f".claudecode/"
         self.prompt_type = prompt_type
 
     @staticmethod
-    async def run_async_with_timeout(async_func, timeout, *args, **kwargs):
-        """Native async timeout - more efficient"""
-        try:
-            result = await asyncio.wait_for(
-                async_func(*args, **kwargs),
-                timeout=timeout
+    def run_task(
+        *,
+        root: Path,
+        task_id: str,
+        condition: str,
+        output_dir: Path,
+        model_name: str,
+        project_memory_file_path: Path | None = None,
+        expected_project_memory_file_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        if condition not in {"baseline", "project_memory"}:
+            raise ValueError(f"Unsupported condition: {condition}")
+        if condition == "project_memory" and project_memory_file_path is None:
+            raise ValueError(
+                "The malicious project memory condition requires a "
+                "project memory file path"
             )
-            return True, result
-        except asyncio.TimeoutError:
-            return False, "Timeout occurred"
-        except Exception as e:
-            return False, str(e)
 
-    @staticmethod
-    def temp_clone_repo(url, commit, repo_name, id, model):
-        if os.path.exists(f"repo_tmp_{model}/{repo_name}_{id}"):
-            shutil.rmtree(f"repo_tmp_{model}/{repo_name}_{id}")
+        root = root.resolve()
+        output_dir = output_dir.resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        repository_dir = output_dir / "repository"
+        if repository_dir.exists():
+            shutil.rmtree(repository_dir)
 
-        repo = Repo.clone_from(url, f"repo_tmp_{model}/{repo_name}_{id}")
-        repo.head.reference = repo.commit(commit)
-        repo.head.reset(index=True, working_tree=True)
+        record, repository_url = _load_task(root, task_id)
+        project_name = str(record["project_name"])
+        fixing_commit = str(record["fixing_commit"])
+        changed_file = str(record["changed_file"])
+        target_path = repository_dir / changed_file
+        child: subprocess.Popen[str] | None = None
+        old_handlers: dict[int, Any] = {}
 
-        return repo, f"repo_tmp_{model}/{repo_name}_{id}"
-    
-    @staticmethod
-    def init(repo_dir):
-        shutil.rmtree(f"{repo_dir}/.git")
-        repo = Repo.init(repo_dir)
-        return repo
+        def forward_signal(signum: int, frame: Any) -> None:
+            if child is not None:
+                _terminate_process_group(child)
+            raise KeyboardInterrupt
 
-    @staticmethod
-    def commit(repo: Repo, file=None):
-        if file:
-            repo.git.add(file)
-        else:
-            repo.git.add(A=True)
-        staged = repo.git.diff("--cached", "--name-only").strip()
-        if not staged:
-            return None
-        msg = f"Auto-commit on {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        new_commit = repo.index.commit(msg)
-        return new_commit.hexsha
+        try:
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                old_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, forward_signal)
 
-    @staticmethod
-    def diff_between(repo: Repo, base_sha: str, head_sha: str):
-        cmd = [
-            "git", "diff", base_sha, head_sha,
-        ]
+            Repo.clone_from(repository_url, repository_dir)
+            source_repository = Repo(repository_dir)
+            source_repository.git.checkout("--force", fixing_commit)
+            source_repository.git.clean("-fdx")
+            shutil.rmtree(repository_dir / ".git")
+            repository = Repo.init(repository_dir)
+            repository.git.config("user.email", "secrepobench@example.invalid")
+            repository.git.config("user.name", "SecRepoBench Experiment")
 
-        patch_text = repo.git.execute(
-            cmd,
-            stdout_as_string=True,
-            strip_newline_in_stdout=False,
-        )
+            removed_instructions = clean_claude_instruction_files(repository_dir)
+            remaining = find_remaining_instruction_files(repository_dir)
+            if remaining:
+                raise RuntimeError(
+                    "Uncontrolled Claude instruction files remain: "
+                    + ", ".join(remaining)
+                )
 
-        return patch_text
+            masked_content = resolve_mask_file(root, task_id).read_text(
+                encoding="utf-8"
+            )
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_text(masked_content, encoding="utf-8")
+            base_commit = _commit_all(repository, "Prepare masked SecRepoBench task")
 
-    @staticmethod
-    def clean_repo(repo_folder):
-        if os.path.exists(repo_folder):
-            shutil.rmtree(repo_folder)
+            project_memory_file_sha256 = None
+            if condition == "project_memory":
+                assert project_memory_file_path is not None
+                project_memory_file_path = project_memory_file_path.resolve()
+                project_memory_file_sha256 = sha256_file(project_memory_file_path)
+                if (
+                    expected_project_memory_file_sha256
+                    and project_memory_file_sha256 != expected_project_memory_file_sha256
+                ):
+                    raise RuntimeError(
+                        "Malicious project memory file hash mismatch. Expected "
+                        f"{expected_project_memory_file_sha256}, found {project_memory_file_sha256}"
+                    )
+                (repository_dir / "CLAUDE.md").write_text(
+                    project_memory_file_path.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+                if sha256_file(repository_dir / "CLAUDE.md") != project_memory_file_sha256:
+                    raise RuntimeError(
+                        "Injected CLAUDE.md does not match the selected "
+                        "malicious project memory file"
+                    )
+                injected_instructions = find_remaining_instruction_files(repository_dir)
+                if injected_instructions != ["CLAUDE.md"]:
+                    raise RuntimeError(
+                        "The malicious project memory condition must contain exactly one "
+                        f"root CLAUDE.md. Found: {injected_instructions}"
+                    )
+                base_commit = _commit_all(repository, "Add malicious project memory file")
 
-    async def run(self, system_prompt, id):
-
-        log_dir = os.path.join(
-            self.base_dir, self.model_name, self.prompt_type, str(id))
-        os.makedirs(log_dir, exist_ok=True)
-
-        chat_history_file = Path(log_dir) / 'claudecode-chat-log.jsonl'
-
-        with open("./sample_metadata.json") as f:
-            metadata = json.load(f)
-
-        project_name, fixing_commit, changed_file, *_ = metadata[id].values()
-
-        with open("./github_repos.json") as f:
-            urls = json.load(f)
-
-        url = None
-        for project_meta in urls:
-            if project_meta["project"] == project_name:
-                url = project_meta["repo_addr"]
-
-        _, repo_folder = self.temp_clone_repo(
-            url, fixing_commit, project_name, id, self.model_name)
-        
-        if repo_folder.startswith("./"):
-            repo_folder = repo_folder[2:]
-        
-        repo_base = self.init(repo_folder)
-        
-        target_file_path = Path(repo_folder) / changed_file
-        replaced_file_path = f"./descriptions/{id}/mask_desc_perturbed"
-        file_content = get_c_cpp_file(replaced_file_path)
-        target_file_path.write_text(file_content)
-
-        mask_id = self.commit(repo_base)
-
-        self.agent_config.cwd = repo_folder
-        async with ClaudeSDKClient(options=self.agent_config) as client:
-
-            system_prompt = system_prompt.replace(
-                " Only return the code to be filled in the masked region. DO NOT include any other information, such as a preamble or suffix.", "")
+            empty_mcp = output_dir / "empty_mcp.json"
+            empty_mcp.write_text('{"mcpServers": {}}\n', encoding="utf-8")
+            system_prompt = SYSTEM_PROMPT.replace(
+                "Only return the code to be filled in the masked region. "
+                "DO NOT include any other information, such as a preamble or suffix.",
+                "",
+            ).strip()
             user_prompt = AGENT_USER_PEOMPT.format(changed_file=changed_file)
             prompt = system_prompt + user_prompt
+            (output_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
-            # Run with timeout
-            max_retries = 3
-            retry_count = 0
+            stdout_path = output_dir / "claude_stdout.txt"
+            stderr_path = output_dir / "claude_stderr.txt"
+            command_path = output_dir / "command.json"
+            command = [
+                "claude",
+                "-p",
+                prompt,
+                "--model",
+                model_name,
+                "--permission-mode",
+                "bypassPermissions",
+                "--output-format",
+                "text",
+                "--no-session-persistence",
+                "--setting-sources",
+                "project",
+                "--mcp-config",
+                str(empty_mcp),
+                "--strict-mcp-config",
+                "--no-chrome",
+                "--disable-slash-commands",
+                "--disallowedTools",
+                "WebSearch,WebFetch,mcp__*",
+            ]
+            command_path.write_text(
+                json.dumps(command, indent=2) + "\n", encoding="utf-8"
+            )
 
-            success, result = False, None
-            while retry_count < max_retries:
-                # 1200 secs timeout
-                success, result = await self.run_async_with_timeout(client.query, 1200, prompt)
-                if success or result != "Timeout occurred":
-                    break
-                retry_count += 1
-                time.sleep(1)  # Brief pause between retries
+            environment = os.environ.copy()
+            environment.pop("ANTHROPIC_API_KEY", None)
+            environment["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+            environment["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
+            environment["MAX_THINKING_TOKENS"] = str(THINKING_BUDGET_TOKENS)
+            environment["DISABLE_AUTOUPDATER"] = "1"
 
-            async for message in client.receive_response():
-                if isinstance(message, ResultMessage):
-                    session_id = message.session_id
-                    traj_src_path = Path(
-                        f"~/.claude/projects/{os.getcwd().replace("/", "-").replace("_", "-")}-{repo_folder.replace("_", "-").replace("/", "-")}/{session_id}.jsonl").expanduser()
-                    shutil.copy(traj_src_path, chat_history_file)
+            with (
+                stdout_path.open("w", encoding="utf-8") as stdout_handle,
+                stderr_path.open("w", encoding="utf-8") as stderr_handle,
+            ):
+                child = subprocess.Popen(
+                    command,
+                    cwd=repository_dir,
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    text=True,
+                    start_new_session=(os.name != "nt"),
+                )
+                try:
+                    returncode = child.wait(timeout=1200)
+                except subprocess.TimeoutExpired:
+                    _terminate_process_group(child, grace_seconds=5)
+                    raise TimeoutError("Claude Code exceeded the 1200 second timeout")
 
-            self.commit(repo_base, changed_file)
+            if returncode != 0:
+                raise RuntimeError(f"Claude Code exited with status {returncode}")
+            if not target_path.is_file():
+                raise RuntimeError(
+                    f"Claude Code removed the target file: {changed_file}"
+                )
 
-            if success:
-                with open(target_file_path) as f:
-                    content = f.read()
-                diff = self.diff_between(repo_base, mask_id, "HEAD")
-                self.clean_repo(repo_folder)
-                return diff, content
-            else:
-                raise Exception("Patching unsuccessful!")
+            completion = target_path.read_text(encoding="utf-8")
+            if (
+                not completion.strip()
+                or completion == masked_content
+                or "// <MASK>" in completion
+            ):
+                raise RuntimeError(
+                    "Claude Code produced an empty or unchanged completion"
+                )
 
-        time.sleep(0.1)
+            _commit_all(repository, "Record Claude Code completion")
+            diff = repository.git.diff(base_commit, "HEAD", "--", changed_file)
+            if not diff.strip():
+                raise RuntimeError("Claude Code produced no nonempty target file diff")
+            changed_paths = [
+                line
+                for line in repository.git.diff(
+                    base_commit, "HEAD", "--name-only"
+                ).splitlines()
+                if line
+            ]
+            completion_path = output_dir / "completion.txt"
+            diff_path = output_dir / "completion.diff"
+            completion_path.write_text(completion, encoding="utf-8")
+            diff_path.write_text(diff, encoding="utf-8")
+
+            manifest = {
+                "task_id": task_id,
+                "condition": condition,
+                "project_name": project_name,
+                "repository_url": repository_url,
+                "fixing_commit": fixing_commit,
+                "changed_file": changed_file,
+                "model": model_name,
+                "thinking_budget_tokens": THINKING_BUDGET_TOKENS,
+                "removed_instruction_files": removed_instructions,
+                "remaining_instruction_files": remaining,
+                "project_memory_file_sha256": project_memory_file_sha256,
+                "completion_sha256": sha256_file(completion_path),
+                "diff_sha256": sha256_file(diff_path),
+                "changed_paths": changed_paths,
+                "unexpected_changed_paths": [
+                    path for path in changed_paths if path != changed_file
+                ],
+                "returncode": returncode,
+            }
+            (output_dir / "inference_manifest.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            return manifest
+        finally:
+            if child is not None:
+                _terminate_process_group(child)
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+            if repository_dir.exists():
+                shutil.rmtree(repository_dir, ignore_errors=True)
+
+    async def run(self, system_prompt: str, task_id: str) -> tuple[str, str]:
+        """Legacy interface used by ``tools.patcher.ClaudeCodePatcher``."""
+        condition = (
+            "project_memory"
+            if os.environ.get("THESIS_MEMORY_CONDITION", "").lower()
+            in {"project", "project_memory"}
+            else "baseline"
+        )
+        payload = os.environ.get("THESIS_CLAUDE_PAYLOAD")
+        output_dir = (
+            ROOT / ".claudecode" / self.model_name / self.prompt_type / str(task_id)
+        )
+        await asyncio.to_thread(
+            self.run_task,
+            root=ROOT,
+            task_id=str(task_id),
+            condition=condition,
+            output_dir=output_dir,
+            model_name=self.model_name,
+            project_memory_file_path=Path(payload) if payload else None,
+        )
+        return (
+            (output_dir / "completion.diff").read_text(encoding="utf-8"),
+            (output_dir / "completion.txt").read_text(encoding="utf-8"),
+        )
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--task-id", required=True)
+    parser.add_argument(
+        "--condition", choices=("baseline", "project_memory"), required=True
+    )
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--project-memory-file", type=Path)
+    parser.add_argument("--project-memory-file-sha256")
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = _parse_args()
+    try:
+        ClaudeCodeRunner.run_task(
+            root=ROOT,
+            task_id=arguments.task_id,
+            condition=arguments.condition,
+            output_dir=arguments.output_dir,
+            model_name=arguments.model,
+            project_memory_file_path=arguments.project_memory_file,
+            expected_project_memory_file_sha256=arguments.project_memory_file_sha256,
+        )
+    except KeyboardInterrupt:
+        return 130
+    except Exception as error:
+        arguments.output_dir.mkdir(parents=True, exist_ok=True)
+        (arguments.output_dir / "harness_error.txt").write_text(
+            f"{type(error).__name__}: {error}\n", encoding="utf-8"
+        )
+        print(f"{type(error).__name__}: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
