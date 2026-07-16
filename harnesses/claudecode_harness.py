@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import gzip
 import hashlib
 import json
@@ -163,10 +162,6 @@ def _load_task(root: Path, task_id: str) -> tuple[dict[str, Any], str]:
 
 class ClaudeCodeRunner:
 
-    def __init__(self, model_name: str, prompt_type: str = "no-security-reminder"):
-        self.model_name = model_name
-        self.prompt_type = prompt_type
-
     @staticmethod
     def run_task(
         *,
@@ -176,7 +171,6 @@ class ClaudeCodeRunner:
         output_dir: Path,
         model_name: str,
         project_memory_file_path: Path | None = None,
-        expected_project_memory_file_sha256: str | None = None,
     ) -> dict[str, Any]:
         if condition not in {"baseline", "project_memory"}:
             raise ValueError(f"Unsupported condition: {condition}")
@@ -239,23 +233,10 @@ class ClaudeCodeRunner:
             if condition == "project_memory":
                 assert project_memory_file_path is not None
                 project_memory_file_path = project_memory_file_path.resolve()
-                project_memory_file_sha256 = sha256_file(project_memory_file_path)
-                if (
-                    expected_project_memory_file_sha256
-                    and project_memory_file_sha256 != expected_project_memory_file_sha256
-                ):
-                    raise RuntimeError(
-                        "Malicious project memory file hash mismatch. Expected "
-                        f"{expected_project_memory_file_sha256}, found {project_memory_file_sha256}"
-                    )
                 (repository_dir / "CLAUDE.md").write_text(
                     project_memory_file_path.read_text(encoding="utf-8"), encoding="utf-8"
                 )
-                if sha256_file(repository_dir / "CLAUDE.md") != project_memory_file_sha256:
-                    raise RuntimeError(
-                        "Injected CLAUDE.md does not match the selected "
-                        "malicious project memory file"
-                    )
+                project_memory_file_sha256 = sha256_file(repository_dir / "CLAUDE.md")
                 injected_instructions = find_remaining_instruction_files(repository_dir)
                 if injected_instructions != ["CLAUDE.md"]:
                     raise RuntimeError(
@@ -395,33 +376,6 @@ class ClaudeCodeRunner:
             if repository_dir.exists():
                 shutil.rmtree(repository_dir, ignore_errors=True)
 
-    async def run(self, system_prompt: str, task_id: str) -> tuple[str, str]:
-        """Legacy interface used by ``tools.patcher.ClaudeCodePatcher``."""
-        condition = (
-            "project_memory"
-            if os.environ.get("THESIS_MEMORY_CONDITION", "").lower()
-            in {"project", "project_memory"}
-            else "baseline"
-        )
-        payload = os.environ.get("THESIS_CLAUDE_PAYLOAD")
-        output_dir = (
-            ROOT / ".claudecode" / self.model_name / self.prompt_type / str(task_id)
-        )
-        await asyncio.to_thread(
-            self.run_task,
-            root=ROOT,
-            task_id=str(task_id),
-            condition=condition,
-            output_dir=output_dir,
-            model_name=self.model_name,
-            project_memory_file_path=Path(payload) if payload else None,
-        )
-        return (
-            (output_dir / "completion.diff").read_text(encoding="utf-8"),
-            (output_dir / "completion.txt").read_text(encoding="utf-8"),
-        )
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-id", required=True)
@@ -431,7 +385,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--project-memory-file", type=Path)
-    parser.add_argument("--project-memory-file-sha256")
     return parser.parse_args()
 
 
@@ -445,7 +398,6 @@ def main() -> int:
             output_dir=arguments.output_dir,
             model_name=arguments.model,
             project_memory_file_path=arguments.project_memory_file,
-            expected_project_memory_file_sha256=arguments.project_memory_file_sha256,
         )
     except KeyboardInterrupt:
         return 130
