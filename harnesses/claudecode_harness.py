@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import gzip
-import hashlib
 import json
 import os
 import shutil
@@ -19,6 +17,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from assets.constants import AGENT_USER_PEOMPT, SYSTEM_PROMPT, THINKING_BUDGET_TOKENS  # noqa: E402
+from tools.experiment_utils import (  # noqa: E402
+    load_repository_urls,
+    load_sample_metadata,
+    resolve_mask_file,
+    sha256_file,
+    terminate_process_group,
+)
 
 INSTRUCTION_FILENAMES = {"claude.md", "claude.local.md"}
 CLAUDE_CONFIGURATION_FILES = {
@@ -28,65 +33,7 @@ CLAUDE_CONFIGURATION_FILES = {
 }
 
 
-def read_json_auto(path: Path) -> Any:
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def resolve_data_file(root: Path, stem: str) -> Path:
-    candidates = (root / stem, root / f"{stem}.gz")
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(
-        f"Required data file is missing. Expected {candidates[0]} or {candidates[1]}."
-    )
-
-
-def resolve_mask_file(root: Path, task_id: str) -> Path:
-    base = root / "descriptions" / task_id / "mask_desc_perturbed"
-    for suffix in (".c", ".cpp"):
-        candidate = Path(str(base) + suffix)
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(
-        f"Task {task_id}: missing perturbed masked source file under {base.parent}"
-    )
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _terminate_process_group(
-    process: subprocess.Popen[str], grace_seconds: int = 10
-) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        if os.name == "nt":
-            process.terminate()
-        else:
-            os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=grace_seconds)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        if process.poll() is not None:
-            return
-        try:
-            if os.name == "nt":
-                process.kill()
-            else:
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=10)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
-            return
-
-
+# Removes only paths inside the task repository to keep instruction cleanup safely contained.
 def _safe_remove(path: Path, repository_root: Path) -> None:
     resolved_root = repository_root.resolve()
     resolved_path = path.resolve(strict=False)
@@ -100,9 +47,8 @@ def _safe_remove(path: Path, repository_root: Path) -> None:
         shutil.rmtree(path)
 
 
+# Removes uncontrolled Claude instructions and integrations so both conditions start consistently.
 def clean_claude_instruction_files(repository_root: Path) -> list[str]:
-    """Remove project controlled Claude instructions and project integrations.
-    """
     repository_root = repository_root.resolve()
     removed: list[str] = []
     for path in list(repository_root.rglob("*")):
@@ -124,6 +70,7 @@ def clean_claude_instruction_files(repository_root: Path) -> list[str]:
     return sorted(set(removed))
 
 
+# Finds remaining Claude instructions to verify baseline isolation and controlled memory injection.
 def find_remaining_instruction_files(repository_root: Path) -> list[str]:
     remaining: list[str] = []
     for path in repository_root.rglob("*"):
@@ -134,6 +81,7 @@ def find_remaining_instruction_files(repository_root: Path) -> list[str]:
     return sorted(set(remaining))
 
 
+# Commits the prepared repository state so the model's subsequent changes can be measured exactly.
 def _commit_all(repository: Repo, message: str) -> str:
     repository.git.add(A=True)
     if not repository.git.diff("--cached", "--name-only").strip():
@@ -141,27 +89,20 @@ def _commit_all(repository: Repo, message: str) -> str:
     return repository.index.commit(message).hexsha
 
 
+# Loads and validates task metadata and its repository URL so each run uses the correct project state.
 def _load_task(root: Path, task_id: str) -> tuple[dict[str, Any], str]:
-    metadata = read_json_auto(resolve_data_file(root, "sample_metadata.json"))
+    metadata = load_sample_metadata(root)
     record = metadata.get(task_id)
     if not isinstance(record, dict):
         raise KeyError(f"Unknown SecRepoBench task: {task_id}")
-    repositories = read_json_auto(root / "github_repos.json")
-    repository_url = next(
-        (
-            str(row["repo_addr"])
-            for row in repositories
-            if row.get("project") == record.get("project_name")
-        ),
-        "",
-    )
+    repository_url = load_repository_urls(root).get(str(record.get("project_name")), "")
     if not repository_url:
         raise RuntimeError(f"No repository URL for {record.get('project_name')}")
     return record, repository_url
 
 
 class ClaudeCodeRunner:
-
+    # Runs one isolated condition and records its completion, diff, logs, and provenance artifacts.
     @staticmethod
     def run_task(
         *,
@@ -195,9 +136,10 @@ class ClaudeCodeRunner:
         child: subprocess.Popen[str] | None = None
         old_handlers: dict[int, Any] = {}
 
+        # Forwards termination signals to Claude Code so interrupted runs shut down cleanly.
         def forward_signal(signum: int, frame: Any) -> None:
             if child is not None:
-                _terminate_process_group(child)
+                terminate_process_group(child)
             raise KeyboardInterrupt
 
         try:
@@ -234,7 +176,7 @@ class ClaudeCodeRunner:
                 assert project_memory_file_path is not None
                 project_memory_file_path = project_memory_file_path.resolve()
                 (repository_dir / "CLAUDE.md").write_text(
-                    project_memory_file_path.read_text(encoding="utf-8"), encoding="utf-8"
+                    project_memory_file_path.read_text(encoding="utf-8"), encoding="utf-8",
                 )
                 project_memory_file_sha256 = sha256_file(repository_dir / "CLAUDE.md")
                 injected_instructions = find_remaining_instruction_files(repository_dir)
@@ -308,7 +250,7 @@ class ClaudeCodeRunner:
                 try:
                     returncode = child.wait(timeout=1200)
                 except subprocess.TimeoutExpired:
-                    _terminate_process_group(child, grace_seconds=5)
+                    terminate_process_group(child, grace_seconds=5)
                     raise TimeoutError("Claude Code exceeded the 1200 second timeout")
 
             if returncode != 0:
@@ -370,12 +312,14 @@ class ClaudeCodeRunner:
             return manifest
         finally:
             if child is not None:
-                _terminate_process_group(child)
+                terminate_process_group(child)
             for signum, handler in old_handlers.items():
                 signal.signal(signum, handler)
             if repository_dir.exists():
                 shutil.rmtree(repository_dir, ignore_errors=True)
 
+
+# Defines the single-run CLI contract needed by the external experiment orchestrator.
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-id", required=True)
@@ -388,6 +332,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# Executes one requested run and exposes success, failure, or interruption through stable exit codes.
 def main() -> int:
     arguments = _parse_args()
     try:
